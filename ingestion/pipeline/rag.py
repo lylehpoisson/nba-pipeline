@@ -25,7 +25,7 @@ load_dotenv()
 BATCH_SIZE = 50
 EMBED_MODEL = "models/gemini-embedding-001"
 CHAT_MODEL = "claude-haiku-4-5-20251001"
-RATE_LIMIT = 2  # requests per minute (leave 10% headroom below 100)
+RATE_LIMIT = 90  # requests per minute (leave 10% headroom below 100)
 WINDOW = 60.0  # seconds
 EMBEDDINGS_CACHE = Path(__file__).parent.parent / "embeddings_cache.pkl"
 

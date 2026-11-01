@@ -1,19 +1,24 @@
 # NBA Pipeline 🏀
 
-End-to-end data pipeline pulling NBA game logs from the public `nba_api` into Snowflake, transforming them with dbt, and orchestrated with Dagster on a nightly schedule.
+End-to-end data pipeline pulling NBA game logs from the public `nba_api` into Snowflake, transforming them with dbt, and orchestrated with Dagster on a nightly schedule. A RAG layer answers natural language questions about teams and players.
 
-**Stack:** Python · nba_api · Snowflake · dbt-core · Dagster
+**Stack:** Python · nba_api · Snowflake · dbt-core · Dagster · Gemini embeddings · Claude
 
 ## Architecture
 
 ```
 nba_api (free, no key)
     └─► Dagster (nightly schedule, 9am UTC)
-            └─► ingestion/cli.py
+            └─► ingestion/pipeline/load.py
                     └─► NBA_DB.RAW           (3 raw tables, loaded via stage + COPY INTO)
                             └─► dbt run
-                                    ├─► DBT_DEV_STAGING   (views — type-cast + renamed)
+                                    ├─► DBT_DEV_STAGING   (incremental tables — type-cast + renamed)
                                     └─► DBT_DEV_MARTS     (tables — aggregated, ranked)
+
+DBT_DEV_MARTS (on demand, not part of the nightly job)
+    └─► ingestion/pipeline/rag.py
+            └─► NBA_DB.RAW.EMBEDDINGS   (Gemini embeddings of team and player summaries)
+                    └─► question → Snowflake vector search → answer from Claude
 ```
 
 ## Repo layout
@@ -21,12 +26,16 @@ nba_api (free, no key)
 ```
 nba_pipeline/
 ├── ingestion/
-│   ├── cli.py                  # Entry point: python cli.py load [--season YYYY-YY]
-│   ├── load_to_snowflake.py    # Extracts from nba_api, loads RAW layer
+│   ├── pyproject.toml          # Makes `pipeline` an installable package
+│   ├── pipeline/
+│   │   ├── cli.py              # Entry point: load, embed, and query commands
+│   │   ├── load.py             # Extracts from nba_api, loads RAW layer
+│   │   └── rag.py              # Generates embeddings, answers questions
 │   └── sql/
 │       ├── create_raw_teams.sql
 │       ├── create_raw_team_game_logs.sql
-│       └── create_raw_player_game_logs.sql
+│       ├── create_raw_player_game_logs.sql
+│       └── create_embeddings.sql
 ├── dbt_project/
 │   ├── dbt_project.yml
 │   ├── profiles.yml            # Reads SNOWFLAKE_PASSWORD from env
@@ -41,11 +50,14 @@ nba_pipeline/
 ├── dagster_project/
 │   └── nba_pipeline/
 │       └── nba_pipeline/
-│           ├── assets.py       # Raw ingestion assets (Python)
+│           ├── assets.py       # Raw ingestion and embeddings assets (Python)
 │           ├── dbt_assets.py   # dbt models as Dagster assets
 │           └── definitions.py  # Wires assets, resources, schedule
+├── start.ps1                   # Windows: loads .env, parses dbt, starts Dagster
 ├── requirements.in             # Top-level deps (compile with pip-compile)
-└── requirements.txt
+├── requirements.txt
+├── ROADMAP.md
+└── LICENSE
 ```
 
 ## Setup
@@ -58,6 +70,7 @@ cd nba_pipeline
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+pip install -e ingestion
 ```
 
 ### 2. Configure credentials
@@ -73,16 +86,17 @@ SNOWFLAKE_DATABASE=NBA_DB
 SNOWFLAKE_SCHEMA=RAW
 SNOWFLAKE_ROLE=ACCOUNTADMIN
 DBT_SCHEMA=DBT_DEV
+GOOGLE_API_KEY=your-google-api-key
+ANTHROPIC_API_KEY=your-anthropic-api-key
 ```
 
-`SNOWFLAKE_SCHEMA` is the raw ingestion target; `DBT_SCHEMA` is the schema dbt writes transformed models into. `dbt_project/profiles.yml` reads all connection fields from the environment.
+`SNOWFLAKE_SCHEMA` is the raw ingestion target; `DBT_SCHEMA` is the schema dbt writes transformed models into. `dbt_project/profiles.yml` reads all connection fields from the environment. `GOOGLE_API_KEY` and `ANTHROPIC_API_KEY` are only needed for the RAG layer.
 
 ### 3. Load raw data manually (optional)
 
 ```bash
-cd ingestion
-python cli.py load                    # defaults to 2025-26
-python cli.py load --season 2023-24   # any prior season
+python -m pipeline.cli load                    # defaults to 2025-26
+python -m pipeline.cli load --season 2023-24   # any prior season
 ```
 
 This creates `NBA_DB.RAW` in Snowflake and loads three tables:
@@ -114,16 +128,32 @@ cd dagster_project/nba_pipeline
 dagster dev
 ```
 
-Open http://127.0.0.1:3000. The pipeline runs on a nightly schedule at 9am UTC (after all NBA games have finished). To trigger a manual run, go to Catalog → select all assets → Materialize all.
+On Windows, you can run `.\start.ps1` from the repo root instead. It loads `.env`, regenerates the dbt manifest, and starts Dagster.
+
+Open http://127.0.0.1:3000. The pipeline runs on a nightly schedule at 9am UTC (after all NBA games have finished). The nightly job covers the raw and dbt assets but not `embeddings`. To trigger a manual run of everything, go to Catalog → select all assets → Materialize all.
+
+### 6. Query with the RAG layer
+
+Build the marts first, then generate embeddings and ask a question:
+
+```bash
+python -m pipeline.cli embed
+python -m pipeline.cli query "Which teams have the best home records?"
+python -m pipeline.cli query "Who are the most efficient scorers?" --top-k 10
+```
+
+`embed` only re-embeds teams and players whose summary text has changed. `query` retrieves the closest summaries from `NBA_DB.RAW.EMBEDDINGS` (5 by default) and has Claude answer from them.
 
 ## Data models
 
-### Staging (views in `DBT_DEV_STAGING`)
+### Staging (incremental tables in `DBT_DEV_STAGING`)
 
-| Model | Source table | What it does |
-|---|---|---|
-| `stg_team_game_logs` | `RAW_TEAM_GAME_LOGS` | Types all columns, derives `season` from `SEASON_ID`, adds `home_away` flag |
-| `stg_player_game_logs` | `RAW_PLAYER_GAME_LOGS` | Types all columns, excludes DNPs |
+Each run only processes games newer than the latest `game_date` already in the table. Use `dbt run --full-refresh` to rebuild from scratch.
+
+| Model | Source table | Unique key | What it does |
+|---|---|---|---|
+| `stg_team_game_logs` | `RAW_TEAM_GAME_LOGS` | `game_id`, `team_id` | Types all columns, derives `season` from `SEASON_ID`, adds `home_away` flag |
+| `stg_player_game_logs` | `RAW_PLAYER_GAME_LOGS` | `game_id`, `player_id` | Types all columns, excludes DNPs |
 
 ### Marts (tables in `DBT_DEV_MARTS`)
 
@@ -143,7 +173,9 @@ pip-compile requirements.in
 
 ## Roadmap
 
-- Incremental dbt models — append new games only instead of full refresh
-- `mart_rolling_team_form` — last-10-games rolling window using Snowflake window functions
-- Multi-season backfill command (`cli.py backfill --start 2020-21 --end 2025-26`)
-- RAG layer — player/team embeddings in a vector database for natural language queries
+**Recently shipped:**
+
+- **Incremental dbt models** — `stg_team_game_logs` and `stg_player_game_logs` now process new games only instead of rebuilding on every run
+- **RAG layer** — natural language queries over team and player season summaries, using Gemini embeddings, Snowflake vector search, and Claude for answers
+
+See [ROADMAP.md](ROADMAP.md) for what's next.
